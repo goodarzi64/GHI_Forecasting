@@ -1,0 +1,25 @@
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb~
+
+# Python
+__pycache__/
+*.pyc
+
+# VS Code
+.vscode/
+
+# Data & artifacts (do NOT commit)
+data/
+/content/gdrive/
+outputs/
+checkpoints/
+*.npz
+*.npy
+*.pt
+*.pth
+*.ckpt
+
+# OS
+.DS_Store
+Thumbs.db
