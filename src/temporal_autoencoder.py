@@ -42,8 +42,9 @@ class TemporalWindowAutoEncoder(nn.Module):
         if mask_cloud is None:
             raise ValueError("mask_cloud must be provided to TemporalWindowAutoEncoder")
 
-        # Register mask for cloud features
-        self.register_buffer("mask_cloud", mask_cloud.detach().clone().to(torch.bool))
+        # Register mask for cloud features (accept torch or numpy)
+        mask_cloud_t = torch.as_tensor(mask_cloud).to(torch.bool)
+        self.register_buffer("mask_cloud", mask_cloud_t.detach().clone())
 
         # Count number of explicit cloud classes (e.g., 9)
         self.num_cloud_classes = int(self.mask_cloud.sum().item())
