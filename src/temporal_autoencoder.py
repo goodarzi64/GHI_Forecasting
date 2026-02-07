@@ -239,7 +239,7 @@ def pretrain_en_de_with_regularizers(
         n_batches = 0
 
         for x_t in tqdm(train_loader, desc=f"Epoch {epoch}/{epochs} [Train]", leave=False):
-            x_t = x_t.to(device)
+            x_t = x_t.to(device=device, dtype=torch.float32)
             emb_t = x_t[..., mask_embed] if mask_embed is not None else x_t
 
             optimizer.zero_grad()
@@ -270,7 +270,7 @@ def pretrain_en_de_with_regularizers(
 
             with torch.no_grad():
                 for x_t in tqdm(val_loader, desc=f"Epoch {epoch}/{epochs} [Val]", leave=False):
-                    x_t = x_t.to(device)
+                    x_t = x_t.to(device=device, dtype=torch.float32)
                     emb_t = x_t[..., mask_embed] if mask_embed is not None else x_t
 
                     recon_loss, _z_t = model(emb_t)
