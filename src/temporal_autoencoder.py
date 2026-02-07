@@ -126,8 +126,8 @@ class TemporalWindowAutoEncoder(nn.Module):
 
     # ============================================================
     def encode_window(self, x: torch.Tensor) -> torch.Tensor:
-        B, W, N, F = x.shape
-        x = x.permute(0, 2, 3, 1).reshape(B * N, F, W)
+        B, W, N, F_in = x.shape
+        x = x.permute(0, 2, 3, 1).reshape(B * N, F_in, W)
         z_seq = self.encoder(x).permute(0, 2, 1)
         if self.use_attention:
             attn_scores = self.attn_fc(z_seq)
