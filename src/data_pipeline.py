@@ -1,13 +1,4 @@
 # src/data_pipeline.py
-"""
-Data + preprocessing pipeline for CYL GHI project.
-
-Design goals:
-- No Colab-specific code here (no drive.mount, no !pip)
-- Paths are passed in from notebooks/scripts
-- Preprocessed artifacts saved/loaded as compressed .npz files
-"""
-
 from __future__ import annotations
 
 import os
@@ -20,183 +11,177 @@ from sklearn.preprocessing import MinMaxScaler
 
 
 # -----------------------------
-# Static geo features
+# Data containers
 # -----------------------------
-def build_static_geo_features(
-    stations_csv_path: str,
-    geo_feature_cols=("height", "Slope_DEM2_U1", "Aspect_DEM2_1", "rastercalc"),
-) -> Tuple[pd.DataFrame, List[str], MinMaxScaler]:
-    """
-    Reads stations.csv and builds normalized static terrain features.
-    Converts aspect(deg) -> sin/cos and drops raw aspect.
-    Returns:
-      vars_geo: (N, G) dataframe (scaled 0..1)
-      station_files: list of station_code
-      geo_scaler: fitted MinMaxScaler
-    """
-    df_geo = pd.read_csv(stations_csv_path)
+@dataclass
+class GeoArtifacts:
+    vars_geo: pd.DataFrame              # (N, G) scaled
+    station_files: List[str]            # station_code list
+    geo_scaler: MinMaxScaler            # fitted scaler
+
+
+@dataclass
+class TemporalArtifacts:
+    temporal_node_tensor: np.ndarray    # (T, N, F) float32
+    temporal_target_tensor: np.ndarray  # (T, N) float32
+    df_cols: np.ndarray                 # (F,) dtype object/str
+    masks: Dict[str, np.ndarray]        # boolean masks
+
+
+# -----------------------------
+# Geo features
+# -----------------------------
+def load_geo_and_build_static_features(
+    geo_dir: str,
+    stations_filename: str = "stations.csv",
+) -> GeoArtifacts:
+    stations_csv = os.path.join(geo_dir, stations_filename)
+    df_geo = pd.read_csv(stations_csv)
     station_files = df_geo["station_code"].tolist()
 
-    vars_geo = df_geo[list(geo_feature_cols)].rename(
-        columns={
-            "Slope_DEM2_U1": "slope",
-            "Aspect_DEM2_1": "aspect",
-            "rastercalc": "twi",
-        }
+    vars_geo = df_geo[["height", "Slope_DEM2_U1", "Aspect_DEM2_1", "rastercalc"]].rename(
+        columns={"Slope_DEM2_U1": "slope", "Aspect_DEM2_1": "aspect", "rastercalc": "twi"}
     )
 
-    # aspect -> sin/cos, drop raw aspect
     aspect_rad = np.deg2rad(vars_geo["aspect"].to_numpy())
     vars_geo["aspect_cos"] = np.cos(aspect_rad)
     vars_geo["aspect_sin"] = np.sin(aspect_rad)
     vars_geo = vars_geo.drop(columns=["aspect"])
 
-    # normalize
     geo_scaler = MinMaxScaler()
     vars_geo_scaled = geo_scaler.fit_transform(vars_geo.to_numpy())
     vars_geo = pd.DataFrame(vars_geo_scaled, columns=vars_geo.columns)
 
-    return vars_geo, station_files, geo_scaler
+    return GeoArtifacts(vars_geo=vars_geo, station_files=station_files, geo_scaler=geo_scaler)
 
 
 # -----------------------------
-# Preprocessed artifacts I/O
+# NPZ I/O
 # -----------------------------
-@dataclass(frozen=True)
-class PreprocessArtifacts:
-    temporal_node_tensor: np.ndarray  # (T, N, F)
-    temporal_target_tensor: np.ndarray  # (T, N)
-    df_cols: np.ndarray  # (F,)
-    masks: Dict[str, np.ndarray]  # boolean masks keyed by name
-
-
-def _artifact_paths(data_dir: str, suffix: str = "2") -> Dict[str, str]:
+def _npz_paths(artifacts_dir: str, suffix: str = "2") -> Dict[str, str]:
     return {
-        "node_tensor": os.path.join(data_dir, f"node_tensor{suffix}.npz"),
-        "target_tensor": os.path.join(data_dir, f"target_tensor{suffix}.npz"),
-        "columns": os.path.join(data_dir, f"columns{suffix}.npz"),
-        "masks": os.path.join(data_dir, f"masks{suffix}.npz"),
+        "node_tensor": os.path.join(artifacts_dir, f"node_tensor{suffix}.npz"),
+        "target_tensor": os.path.join(artifacts_dir, f"target_tensor{suffix}.npz"),
+        "columns": os.path.join(artifacts_dir, f"columns{suffix}.npz"),
+        "masks": os.path.join(artifacts_dir, f"masks{suffix}.npz"),
     }
 
 
-def load_preprocessed(data_dir: str, suffix: str = "2") -> PreprocessArtifacts:
-    """
-    Loads node/target/columns/masks from compressed npz files.
-    Expects files created by save_preprocessed().
-    """
-    paths = _artifact_paths(data_dir, suffix=suffix)
+def load_temporal_artifacts(artifacts_dir: str, suffix: str = "2") -> TemporalArtifacts:
+    paths = _npz_paths(artifacts_dir, suffix)
 
-    node_npz = np.load(paths["node_tensor"], allow_pickle=True)
-    tgt_npz = np.load(paths["target_tensor"], allow_pickle=True)
-    col_npz = np.load(paths["columns"], allow_pickle=True)
-    masks_npz = np.load(paths["masks"], allow_pickle=True)
+    for k, p in paths.items():
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"Missing required artifact: {p}")
 
-    temporal_node_tensor = node_npz["data"]
-    temporal_target_tensor = tgt_npz["data"]
-    df_cols = col_npz["data"]
+    node = np.load(paths["node_tensor"], allow_pickle=True)["data"]
+    tgt = np.load(paths["target_tensor"], allow_pickle=True)["data"]
+    cols = np.load(paths["columns"], allow_pickle=True)["data"]
+    masks_file = np.load(paths["masks"], allow_pickle=True)
+    masks = {k: masks_file[k] for k in masks_file.files}
 
-    masks = {k: masks_npz[k] for k in masks_npz.files}
-    return PreprocessArtifacts(temporal_node_tensor, temporal_target_tensor, df_cols, masks)
+    return TemporalArtifacts(
+        temporal_node_tensor=node,
+        temporal_target_tensor=tgt,
+        df_cols=cols,
+        masks=masks,
+    )
 
 
-def save_preprocessed(
-    data_dir: str,
-    temporal_node_tensor: np.ndarray,
-    temporal_target_tensor: np.ndarray,
-    df_cols: np.ndarray,
-    masks: Dict[str, np.ndarray],
+def save_temporal_artifacts(
+    artifacts_dir: str,
+    artifacts: TemporalArtifacts,
     suffix: str = "2",
 ) -> None:
-    """Saves compressed npz artifacts (node/target/columns/masks)."""
-    os.makedirs(data_dir, exist_ok=True)
-    paths = _artifact_paths(data_dir, suffix=suffix)
+    os.makedirs(artifacts_dir, exist_ok=True)
+    paths = _npz_paths(artifacts_dir, suffix)
 
-    np.savez_compressed(paths["node_tensor"], data=temporal_node_tensor)
-    np.savez_compressed(paths["target_tensor"], data=temporal_target_tensor)
-    np.savez_compressed(paths["columns"], data=df_cols)
-    np.savez_compressed(paths["masks"], **masks)
+    np.savez_compressed(paths["node_tensor"], data=artifacts.temporal_node_tensor)
+    np.savez_compressed(paths["target_tensor"], data=artifacts.temporal_target_tensor)
+    np.savez_compressed(paths["columns"], data=artifacts.df_cols)
+    np.savez_compressed(paths["masks"], **artifacts.masks)
 
 
 # -----------------------------
-# Build from scratch
+# Build tensors from *_prep.csv
 # -----------------------------
-def build_from_scratch(
+def build_temporal_from_prep_csv(
     station_files: List[str],
-    data_dir: str,
+    raw_prep_dir: str,
+    *,
     prep_suffix: str = "_prep.csv",
-    timestamp_col: int = 0,
     target_col: str = "GHI",
+    keep_doy_tod: bool = True,
     exclude_from_norm: Optional[List[str]] = None,
-) -> PreprocessArtifacts:
+) -> TemporalArtifacts:
     """
-    Builds temporal tensors and masks from per-station *_prep.csv files.
-
-    Returns PreprocessArtifacts:
-      temporal_node_tensor: (T, N, F)
-      temporal_target_tensor: (T, N)
-      df_cols: feature names (F,)
-      masks: dict of boolean masks
-
-    Notes:
-    - Expects each station file to be in `data_dir/{station_code}{prep_suffix}`
-    - Applies time encodings + trig features for wind_dir and sun_azim
-    - Normalizes selected features only (MinMaxScaler across all time*nodes)
-    - Appends meteo_cat categorical label as last feature
+    Builds temporal tensors (T,N,F) and masks from per-station *_prep.csv.
+    - Preserves doy/tod (sin/cos) by default
+    - Omits meteorological category (meteo_cat)
     """
     if exclude_from_norm is None:
-        exclude_from_norm = ["NDVI", "wind_dir"]  # plus cloud_* one-hot handled below
+        exclude_from_norm = ["NDVI", "wind_dir"]  # cloud_* handled below
 
-    df_list, target_list = [], []
-    last_df_cols = None
+    df_list: List[np.ndarray] = []
+    target_list: List[np.ndarray] = []
+    df_cols_ref: Optional[List[str]] = None
 
     for station in station_files:
-        path = os.path.join(data_dir, f"{station}{prep_suffix}")
+        path = os.path.join(raw_prep_dir, f"{station}{prep_suffix}")
         df = pd.read_csv(path)
 
-        ts = pd.to_datetime(df.iloc[:, timestamp_col])
-        doy = ts.dt.dayofyear.to_numpy()
-        tod = (ts.dt.hour * 3600 + ts.dt.minute * 60 + ts.dt.second).to_numpy()
+        ts = pd.to_datetime(df.iloc[:, 0])
+        if keep_doy_tod:
+            doy = ts.dt.dayofyear.to_numpy()
+            tod = (ts.dt.hour * 3600 + ts.dt.minute * 60 + ts.dt.second).to_numpy()
+        else:
+            doy = tod = None  # unused
 
-        # add cyclic time + trig transforms
-        df = df.assign(
-            doy_sin=np.sin(2 * np.pi * doy / 365.0),
-            doy_cos=np.cos(2 * np.pi * doy / 365.0),
-            tod_sin=np.sin(2 * np.pi * tod / 86400.0),
-            tod_cos=np.cos(2 * np.pi * tod / 86400.0),
+        assign_kwargs = dict(
             wind_dir_sin=lambda x: np.sin(np.radians(x["wind_dir"])),
             wind_dir_cos=lambda x: np.cos(np.radians(x["wind_dir"])),
             sun_azim_sin=lambda x: np.sin(np.radians(x["sun_azim"])),
             sun_azim_cos=lambda x: np.cos(np.radians(x["sun_azim"])),
         )
+        if keep_doy_tod:
+            assign_kwargs.update(
+                doy_sin=np.sin(2 * np.pi * doy / 365.0),
+                doy_cos=np.cos(2 * np.pi * doy / 365.0),
+                tod_sin=np.sin(2 * np.pi * tod / 86400.0),
+                tod_cos=np.cos(2 * np.pi * tod / 86400.0),
+            )
 
-        # drop raw sun_azim, keep wind_dir at end
+        df = df.assign(**assign_kwargs)
+
+        # Drop raw sun_azim, keep wind_dir last
         if "sun_azim" in df.columns:
             df = df.drop(columns=["sun_azim"])
-        if "wind_dir" in df.columns:
-            cols = [c for c in df.columns if c != "wind_dir"] + ["wind_dir"]
-            df = df[cols]
+        cols = [c for c in df.columns if c != "wind_dir"] + ["wind_dir"]
+        df = df[cols]
 
-        # features / target
         features = df.iloc[:, 1:]  # drop timestamp
-        target = df[target_col].to_numpy()
+        target = df[target_col].to_numpy(dtype=np.float32)
 
-        df_list.append(features)
+        if df_cols_ref is None:
+            df_cols_ref = features.columns.to_list()
+        elif features.columns.to_list() != df_cols_ref:
+            raise ValueError(f"Column mismatch at station {station}. Check *_prep.csv consistency.")
+
+        df_list.append(features.to_numpy(dtype=np.float32))
         target_list.append(target)
-        last_df_cols = features.columns
 
-    if last_df_cols is None:
-        raise ValueError("No station data loaded. Check station_files and data_dir.")
+    if df_cols_ref is None:
+        raise ValueError("No stations loaded.")
 
-    df_cols = np.array(last_df_cols, dtype=object)
-    temporal_node_tensor = np.stack([d.to_numpy() for d in df_list], axis=1)  # (T, N, F)
-    temporal_target_tensor = np.stack(target_list, axis=1)  # (T, N)
+    df_cols = np.array(df_cols_ref, dtype=object)
+    temporal_node_tensor = np.stack(df_list, axis=1).astype(np.float32)        # (T,N,F)
+    temporal_target_tensor = np.stack(target_list, axis=1).astype(np.float32) # (T,N)
 
-    # -----------------------------
     # Normalize selected features
-    # -----------------------------
     cloud_cols = [c for c in df_cols if str(c).startswith("cloud_")]
-    non_norm_features = set(exclude_from_norm) | set(cloud_cols) | {"meteo_cat"}
-    norm_mask = np.array([c not in non_norm_features for c in df_cols], dtype=bool)
+    non_norm = set(exclude_from_norm) | set(cloud_cols)
+
+    norm_mask = np.array([c not in non_norm for c in df_cols], dtype=bool)
     notnorm_mask = ~norm_mask
 
     norm_node = temporal_node_tensor[:, :, norm_mask]
@@ -206,63 +191,27 @@ def build_from_scratch(
     scaler = MinMaxScaler()
     norm_2d = norm_node.reshape(-1, F_norm)
     norm_2d_scaled = scaler.fit_transform(norm_2d)
-    norm_node_scaled = norm_2d_scaled.reshape(T, N, F_norm)
+    norm_node_scaled = norm_2d_scaled.reshape(T, N, F_norm).astype(np.float32)
 
-    temporal_node_tensor_scaled = np.zeros_like(temporal_node_tensor, dtype=np.float32)
-    temporal_node_tensor_scaled[:, :, norm_mask] = norm_node_scaled
-    temporal_node_tensor_scaled[:, :, notnorm_mask] = notnorm_node.astype(np.float32)
-    temporal_node_tensor = temporal_node_tensor_scaled
+    out = np.zeros_like(temporal_node_tensor, dtype=np.float32)
+    out[:, :, norm_mask] = norm_node_scaled
+    out[:, :, notnorm_mask] = notnorm_node.astype(np.float32)
+    temporal_node_tensor = out
 
-    # -----------------------------
-    # Meteorological group label (meteo_cat)
-    # -----------------------------
-    col_idx = {str(col): i for i, col in enumerate(df_cols)}
-    cloud_idxs = [col_idx[c] for c in df_cols if str(c).startswith("cloud_")]
-    cloud_pc_idx = col_idx.get("cloud_Probably_Clear", None)
+    masks = build_feature_masks(df_cols)
 
-    precip_idx = col_idx.get("precipitation", None)
-    aod_idx = col_idx.get("AOD", None)
-    sun_elev_idx = col_idx.get("sun_elev", None)
-
-    if precip_idx is None or aod_idx is None or sun_elev_idx is None:
-        raise KeyError("Expected columns missing: precipitation, AOD, sun_elev")
-
-    group_labels = np.zeros((T, N), dtype=np.int8)
-    for t in range(T):
-        x_t = temporal_node_tensor[t]  # (N, F)
-        for n in range(N):
-            x = x_t[n]
-            is_rainy = x[precip_idx] > 0.1
-            is_dusty = x[aod_idx] > 0.2
-            is_low_sun = x[sun_elev_idx] < 10
-            is_cloudy = any(x[i] > 0 for i in cloud_idxs if i != cloud_pc_idx)
-            is_clear = (all(x[i] == 0 for i in cloud_idxs) or
-                        (cloud_pc_idx is not None and x[cloud_pc_idx] > 0.5))
-
-            if is_rainy:
-                group = 2
-            elif is_dusty:
-                group = 3
-            elif is_low_sun:
-                group = 4
-            elif is_cloudy:
-                group = 1
-            elif is_clear:
-                group = 0
-            else:
-                group = 1
-
-            group_labels[t, n] = group
-
-    temporal_node_tensor = np.concatenate(
-        [temporal_node_tensor, group_labels[..., None].astype(np.float32)],
-        axis=-1,
+    return TemporalArtifacts(
+        temporal_node_tensor=temporal_node_tensor,
+        temporal_target_tensor=temporal_target_tensor,
+        df_cols=df_cols,
+        masks=masks,
     )
-    df_cols = np.append(df_cols, "meteo_cat")
 
-    # -----------------------------
-    # Masks (same intent as your notebook)
-    # -----------------------------
+
+# -----------------------------
+# Masks + helpers
+# -----------------------------
+def build_feature_masks(df_cols: np.ndarray) -> Dict[str, np.ndarray]:
     F = len(df_cols)
     mask_gate = np.zeros(F, dtype=bool)
     mask_wind = np.zeros(F, dtype=bool)
@@ -270,15 +219,14 @@ def build_from_scratch(
     mask_forecast = np.zeros(F, dtype=bool)
     mask_cloud = np.zeros(F, dtype=bool)
 
-    col_idx = {str(col): i for i, col in enumerate(df_cols)}
+    col_idx = {col: i for i, col in enumerate(df_cols)}
 
     for key in [
-        "GHI", "humidity", "precipitation", "air_temp", "sun_elev", "AOD",
-        "C_GHI", "Dew_Point", "S_Albedo", "Pressure", "sun_azim_sin",
-        "sun_azim_cos", "cloud_Clear", "cloud_Probably_Clear", "cloud_Water",
-        "cloud_Super-Cooled_Water", "cloud_Mixed", "cloud_Opaque_Ice",
-        "cloud_Cirrus", "cloud_Overlapping", "cloud_Overshooting",
-        "cloud_Overshooting", "NDVI", "toa", "wind_sp",
+        "GHI","humidity","precipitation","air_temp","sun_elev","AOD",
+        "C_GHI","Dew_Point","S_Albedo","Pressure","sun_azim_sin","sun_azim_cos",
+        "cloud_Clear","cloud_Probably_Clear","cloud_Water","cloud_Super-Cooled_Water",
+        "cloud_Mixed","cloud_Opaque_Ice","cloud_Cirrus","cloud_Overlapping","cloud_Overshooting",
+        "NDVI","toa","wind_sp"
     ]:
         if key in col_idx:
             mask_gate[col_idx[key]] = True
@@ -288,19 +236,17 @@ def build_from_scratch(
             mask_wind[col_idx[key]] = True
 
     for key in [
-        "GHI", "humidity", "precipitation", "air_temp", "sun_elev", "AOD",
-        "C_GHI", "Dew_Point", "S_Albedo", "Pressure", "sun_azim_sin",
-        "sun_azim_cos", "cloud_Clear", "cloud_Probably_Clear", "cloud_Water",
-        "cloud_Super-Cooled_Water", "cloud_Mixed", "cloud_Opaque_Ice",
-        "cloud_Cirrus", "cloud_Overlapping", "cloud_Overshooting",
+        "GHI","humidity","precipitation","air_temp","sun_elev","AOD",
+        "C_GHI","Dew_Point","S_Albedo","Pressure","sun_azim_sin","sun_azim_cos",
+        "cloud_Clear","cloud_Probably_Clear","cloud_Water","cloud_Super-Cooled_Water",
+        "cloud_Mixed","cloud_Opaque_Ice","cloud_Cirrus","cloud_Overlapping","cloud_Overshooting"
     ]:
         if key in col_idx:
             mask_embed[col_idx[key]] = True
 
     for key in [
-        "cloud_Clear", "cloud_Probably_Clear", "cloud_Water",
-        "cloud_Super-Cooled_Water", "cloud_Mixed", "cloud_Opaque_Ice",
-        "cloud_Cirrus", "cloud_Overlapping", "cloud_Overshooting",
+        "cloud_Clear","cloud_Probably_Clear","cloud_Water","cloud_Super-Cooled_Water",
+        "cloud_Mixed","cloud_Opaque_Ice","cloud_Cirrus","cloud_Overlapping","cloud_Overshooting"
     ]:
         if key in col_idx:
             mask_cloud[col_idx[key]] = True
@@ -309,7 +255,7 @@ def build_from_scratch(
         if key not in ["wind_dir", "toa", "NDVI"]:
             mask_forecast[col_idx[key]] = True
 
-    masks = {
+    return {
         "mask_gate": mask_gate,
         "mask_wind": mask_wind,
         "mask_embed": mask_embed,
@@ -317,20 +263,9 @@ def build_from_scratch(
         "mask_cloud": mask_cloud,
     }
 
-    return PreprocessArtifacts(temporal_node_tensor, temporal_target_tensor, df_cols, masks)
 
-
-# -----------------------------
-# Convenience helpers
-# -----------------------------
 def get_wind_positions(df_cols: np.ndarray, masks: Dict[str, np.ndarray]) -> Tuple[int, int]:
-    """
-    Returns positions (within the wind-mask-selected feature list) of:
-      - wind_dir
-      - wind_sp
-    This matches your notebook logic.
-    """
     wind_cols = df_cols[masks["mask_wind"]].tolist()
     if "wind_dir" not in wind_cols or "wind_sp" not in wind_cols:
-        raise KeyError("wind_dir and/or wind_sp not found inside mask_wind selection.")
+        raise KeyError("wind_dir and/or wind_sp not found in wind-mask-selected columns.")
     return wind_cols.index("wind_dir"), wind_cols.index("wind_sp")
