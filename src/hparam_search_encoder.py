@@ -82,9 +82,11 @@ def run_hparam_search(
                         f"ed{embed_dim}_ch{conv_hidden}_seed{seed}_fold{f + 1}.pt",
                     )
 
+                    in_dim = int(mask_embed.sum().item()) if mask_embed is not None else None
                     _, logs, _ = pretrain_en_de_with_regularizers(
                         train_tensor=train_data,
                         val_tensor=val_data,
+                        in_dim=in_dim,
                         embed_dim=embed_dim,
                         conv_hidden=conv_hidden,
                         save_path=ckpt_path,
