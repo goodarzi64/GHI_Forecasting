@@ -1,0 +1,187 @@
+import torch
+
+
+def build_mixed_adjacency(
+    e_window,  # [B, W, N, Fe]
+    w_window,  # [B, W, N, Fw]
+    g_window,  # [B, W, N, Fg] or None
+    node_const,  # [N, Fc] or None
+    Gater,
+    WindKernel,
+    A_static,  # [N,N]
+    Embedor,  # frozen
+    temperature=0.5,
+    topk_each=5,
+    ablation_config=None,
+):
+    """
+    Option B:
+    - ctx_tensor: concatenated tensor → Gater
+    - ctx_dict  : named components → alignment & analysis
+    """
+
+    if ablation_config is None:
+        ablation_config = dict(
+            use_static=True,
+            use_dynamic=True,
+            use_wind=True,
+        )
+
+    dev = e_window.device
+    dtype = e_window.dtype
+    B, W, N, _ = e_window.shape
+
+    # ============================================================
+    # 1) CLOUD EMBEDDINGS (NO GRAD)
+    # ============================================================
+    with torch.no_grad():
+        e_proc = Embedor.apply_cloud_embedding(e_window).to(dev)
+        g_proc = (
+            Embedor.apply_cloud_embedding(g_window).to(dev)
+            if g_window is not None
+            else None
+        )
+
+    g_last = g_proc[:, -1] if g_proc is not None else None
+
+    # ============================================================
+    # 2) NODE CONSTANTS
+    # ============================================================
+    if node_const is None:
+        node_const_tensor = torch.zeros(B, N, 0, device=dev)
+    else:
+        node_const_tensor = node_const.unsqueeze(0).expand(B, N, -1).to(dev)
+
+    # ============================================================
+    # 3) DYNAMIC ADJACENCY (NO GRAD)
+    # ============================================================
+    if ablation_config["use_dynamic"]:
+        with torch.no_grad():
+            Z_last = Embedor.encode_window(e_proc)  # [B,N,D]
+
+        S = Z_last @ Z_last.transpose(-1, -2)  # [B,N,N]
+        A_dyn = torch.softmax(S / temperature, dim=-1)
+        A_dyn.diagonal(dim1=-2, dim2=-1).zero_()
+        A_dyn = topk_row(A_dyn, topk_each)
+    else:
+        A_dyn = torch.zeros(B, N, N, device=dev)
+
+    # ============================================================
+    # 4) STATIC ADJACENCY
+    # ============================================================
+    if ablation_config["use_static"]:
+        A_s = A_static.unsqueeze(0).expand(B, -1, -1).to(dev)
+    else:
+        A_s = torch.zeros(B, N, N, device=dev)
+
+    # ============================================================
+    # 5) WIND ADJACENCY (LAST LAG)
+    # ============================================================
+    if ablation_config["use_wind"]:
+        A_wind_list = []
+        for t in range(W):
+            Aw_t = WindKernel(w_window[:, t], sparse=True, k=topk_each).to(
+                device=dev, dtype=dtype
+            )
+            A_wind_list.append(Aw_t)
+
+        A_wind_window = torch.stack(A_wind_list, dim=1)  # [B,W,N,N]
+        A_wind = A_wind_window[:, -1]
+    else:
+        A_wind_window = torch.zeros(B, W, N, N, device=dev)
+        A_wind = torch.zeros(B, N, N, device=dev)
+
+    # ============================================================
+    # 6) ENERGY (ALL LAGS, VECTORIZED)
+    # ============================================================
+    A_s_full = A_s.unsqueeze(1).expand(-1, W, -1, -1)
+    A_dyn_full = A_dyn.unsqueeze(1).expand(-1, W, -1, -1)
+
+    E_static_window = pairwise_energy(e_proc, A_s_full)  # [B,W,N]
+    E_dyn_window = pairwise_energy(e_proc, A_dyn_full)  # [B,W,N]
+    E_wind_window = pairwise_energy(e_proc, A_wind_window)  # [B,W,N]
+
+    # ============================================================
+    # 7) CONTEXT FEATURES (NAMED)
+    # ============================================================
+    ctx_dict = {}
+
+    ctx_dict["E_static_last"] = minmax_normalize(E_static_window[:, -1].unsqueeze(-1))
+    ctx_dict["E_dyn_last"] = minmax_normalize(E_dyn_window[:, -1].unsqueeze(-1))
+    ctx_dict["E_wind_last"] = minmax_normalize(E_wind_window[:, -1].unsqueeze(-1))
+
+    ctx_dict["Var_E_static"] = minmax_normalize(
+        E_static_window.var(dim=1, unbiased=False).unsqueeze(-1)
+    )
+    ctx_dict["Var_E_dyn"] = minmax_normalize(
+        E_dyn_window.var(dim=1, unbiased=False).unsqueeze(-1)
+    )
+    ctx_dict["Var_E_wind"] = minmax_normalize(
+        E_wind_window.var(dim=1, unbiased=False).unsqueeze(-1)
+    )
+
+    ctx_dict["Deg_static"] = minmax_normalize(A_s.sum(dim=-1, keepdim=True))
+    ctx_dict["Deg_dyn"] = minmax_normalize(A_dyn.sum(dim=-1, keepdim=True))
+    ctx_dict["Deg_wind"] = minmax_normalize(A_wind.sum(dim=-1, keepdim=True))
+
+    # ---- non-cloud g variance ----
+    if g_proc is None or g_proc.shape[-1] <= 3:
+        ctx_dict["Var_g"] = torch.zeros(B, N, 1, device=dev)
+    else:
+        g_noncloud = g_proc[..., :-3]
+        ctx_dict["Var_g"] = minmax_normalize(g_noncloud.var(dim=1, unbiased=False))
+
+    # ============================================================
+    # 8) CONCATENATED CONTEXT TENSOR
+    # ============================================================
+    ctx_tensor = torch.cat(
+        [
+            node_const_tensor,
+            g_last if g_last is not None else torch.zeros(B, N, 0, device=dev),
+            ctx_dict["E_static_last"],
+            ctx_dict["E_dyn_last"],
+            ctx_dict["E_wind_last"],
+            ctx_dict["Var_E_static"],
+            ctx_dict["Var_E_dyn"],
+            ctx_dict["Var_E_wind"],
+            ctx_dict["Deg_static"],
+            ctx_dict["Deg_dyn"],
+            ctx_dict["Deg_wind"],
+            ctx_dict["Var_g"],
+        ],
+        dim=-1,
+    )
+
+    # ============================================================
+    # 9) GATER
+    # ============================================================
+    pi = Gater(ctx_tensor)  # [B,N,4]
+
+    mask = torch.tensor(
+        [
+            ablation_config["use_static"],
+            ablation_config["use_dynamic"],
+            ablation_config["use_wind"],
+        ],
+        device=dev,
+        dtype=pi.dtype,
+    )
+
+    pi = pi * mask
+    pi = pi / (pi.sum(-1, keepdim=True) + 1e-12)
+
+    # ============================================================
+    # 10) MIX ADJACENCY
+    # ============================================================
+    A_mix = pi[..., 0:1] * A_s + pi[..., 1:2] * A_dyn + pi[..., 2:3] * A_wind
+
+    A_mix = topk_row(A_mix, topk_each)
+
+    return A_mix, {
+        "pi": pi,
+        "ctx": ctx_tensor,
+        "ctx_dict": ctx_dict,
+        "A_static": A_s,
+        "A_dynamic": A_dyn,
+        "A_wind": A_wind,
+    }
