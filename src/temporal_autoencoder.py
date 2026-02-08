@@ -82,7 +82,7 @@ class TemporalWindowAutoEncoder(nn.Module):
 
     # ============================================================
     def forward(self, x_t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        B, W, N, F = x_t.shape
+        B, W, N, F_in = x_t.shape
 
         # --- optionally embed cloud features ---
         if self.use_cloud_embed:
@@ -98,7 +98,7 @@ class TemporalWindowAutoEncoder(nn.Module):
     def apply_cloud_embedding(self, x_t: torch.Tensor) -> torch.Tensor:
         """
         Replace one-hot cloud features with learnable latent embedding.
-        Input shape: [B, W, N, F]
+        Input shape: [B, W, N, F_in]
         Output: concatenated features with cloud embedding normalized
         """
         mask = self.mask_cloud.to(x_t.device)
