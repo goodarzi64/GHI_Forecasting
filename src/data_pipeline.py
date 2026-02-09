@@ -7,7 +7,9 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import torch
 from sklearn.preprocessing import MinMaxScaler
+from torch.utils.data import Dataset
 
 
 # -----------------------------
@@ -269,3 +271,64 @@ def get_wind_positions(df_cols: np.ndarray, masks: Dict[str, np.ndarray]) -> Tup
     if "wind_dir" not in wind_cols or "wind_sp" not in wind_cols:
         raise KeyError("wind_dir and/or wind_sp not found in wind-mask-selected columns.")
     return wind_cols.index("wind_dir"), wind_cols.index("wind_sp")
+
+
+class GraphSequenceDataset(Dataset):
+    def __init__(
+        self,
+        node_tensor: np.ndarray,
+        target_tensor: np.ndarray,
+        masks: Dict[str, np.ndarray],
+        lags: int = 6,
+        horizon: int = 1,
+    ) -> None:
+        """
+        Args:
+            node_tensor: [T, N, F] numpy array
+            target_tensor: [T, N] numpy array
+            masks: dictionary with feature masks
+            lags: input sequence length
+            horizon: forecast horizon
+        """
+        self.node_tensor = node_tensor
+        self.target_tensor = target_tensor
+        self.masks = masks
+        self.lags = lags
+        self.horizon = horizon
+
+        T = node_tensor.shape[0]
+        self.length = T - lags - horizon + 1
+
+    def __len__(self) -> int:
+        return self.length
+
+    def __getitem__(self, idx: int):
+        # Forecast features (drop meteo_cat)
+        x_seq_full = self.node_tensor[idx : idx + self.lags, :, self.masks["mask_forecast"]]
+        x_seq = torch.tensor(x_seq_full[..., :-1], dtype=torch.float32)
+
+        # Embedor features
+        e_seq = torch.tensor(
+            self.node_tensor[idx : idx + self.lags, :, self.masks["mask_embed"]],
+            dtype=torch.float32,
+        )
+
+        # Wind features
+        w_seq = torch.tensor(
+            self.node_tensor[idx : idx + self.lags, :, self.masks["mask_wind"]],
+            dtype=torch.float32,
+        )
+
+        # Gate features
+        g_seq = torch.tensor(
+            self.node_tensor[idx : idx + self.lags, :, self.masks["mask_gate"]],
+            dtype=torch.float32,
+        )
+
+        # Targets
+        y_seq = torch.tensor(
+            self.target_tensor[idx + self.lags : idx + self.lags + self.horizon],
+            dtype=torch.float32,
+        )
+
+        return x_seq, e_seq, w_seq, g_seq, y_seq

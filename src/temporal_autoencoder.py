@@ -343,3 +343,27 @@ def pretrain_en_de_with_regularizers(
         print(f"Training complete. Best model at epoch {best_epoch} (no file saved).")
 
     return model, logs, best_epoch
+
+
+def load_pretrained_embedor(
+    ckpt_path: str,
+    mask_cloud,
+    device: str = "cuda",
+) -> TemporalWindowAutoEncoder:
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    cfg = ckpt["config"]
+
+    model = TemporalWindowAutoEncoder(
+        in_dim=cfg["in_dim"],
+        embed_dim=cfg["embed_dim"],
+        window=cfg["window"],
+        conv_hidden=cfg["conv_hidden"],
+        dropout=cfg["dropout"],
+        use_attention=cfg["use_attention"],
+        mask_cloud=mask_cloud,
+    ).to(device)
+
+    model.load_state_dict(ckpt["model_state"], strict=False)
+    model.eval()
+    print(f"Loaded Embedor from {ckpt_path}")
+    return model
