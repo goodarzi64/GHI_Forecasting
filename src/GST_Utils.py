@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import numpy as np
 import torch
+from sklearn.feature_selection import mutual_info_regression
 
 
 # ============================================================
@@ -186,3 +188,73 @@ def corrcoef(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-6) -> torch.Tenso
     a = a - a.mean()
     b = b - b.mean()
     return (a * b).mean() / (a.std() * b.std() + eps)
+
+
+def _center(x: torch.Tensor) -> torch.Tensor:
+    return x - x.mean()
+
+
+def morans_I(
+    x: torch.Tensor,
+    edge_index: torch.Tensor,
+    edge_weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    x = _center(x)
+    N = x.shape[0]
+    i, j = edge_index
+    if edge_weight is None:
+        w = torch.ones_like(i, dtype=x.dtype, device=x.device)
+    else:
+        w = edge_weight
+    S0 = w.sum() + 1e-12
+    num = (w * (x[i] * x[j])).sum()
+    den = (x * x).sum() + 1e-12
+    return (N / S0) * (num / den)
+
+
+def gearys_C(
+    x: torch.Tensor,
+    edge_index: torch.Tensor,
+    edge_weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    x = _center(x)
+    N = x.shape[0]
+    i, j = edge_index
+    if edge_weight is None:
+        w = torch.ones_like(i, dtype=x.dtype, device=x.device)
+    else:
+        w = edge_weight
+    S0 = w.sum() + 1e-12
+    num = (w * (x[i] - x[j]) ** 2).sum()
+    den = 2.0 * (x * x).sum() + 1e-12
+    return ((N - 1) / S0) * (num / den)
+
+
+def pairwise_edge_energy(
+    x: torch.Tensor,
+    edge_index: torch.Tensor,
+    edge_weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    i, j = edge_index
+    if edge_weight is None:
+        w = torch.ones_like(i, dtype=x.dtype, device=x.device)
+    else:
+        w = edge_weight
+    return (w * (x[i] - x[j]) ** 2).sum()
+
+
+def compute_mi(h: torch.Tensor, y: torch.Tensor, max_samples: int = 5000) -> float:
+    h_np = h.detach().cpu().numpy()
+    y_np = y.detach().cpu().numpy()
+
+    if y_np.ndim > 1:
+        y_np = y_np[:, 0]
+
+    N = h_np.shape[0]
+    if N > max_samples:
+        idx = np.random.choice(N, max_samples, replace=False)
+        h_np = h_np[idx]
+        y_np = y_np[idx]
+
+    mi_per_feat = mutual_info_regression(h_np, y_np, random_state=42)
+    return float(np.mean(mi_per_feat))
