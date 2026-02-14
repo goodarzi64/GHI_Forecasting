@@ -5,7 +5,7 @@ from typing import Dict
 import numpy as np
 import torch
 
-from .GST_Utilities import row_normalize, symmetry_normalize, topk_row
+from .GST_Utils import row_normalize, symmetry_normalize, topk_row
 import torch.nn as nn
 
 
@@ -59,39 +59,58 @@ class DistanceKernel:
         return A
 
 
+def build_geo_matrices(df_geo, device: str = "cpu") -> Dict[str, torch.Tensor]:
+    """
+    Compute distance/theta matrices once and reuse across modules.
+    """
+    geo = GeoGeometry(df_geo, device=device)
+    return {
+        "dist_matrix": geo.dist_matrix,
+        "theta_matrix": geo.theta_matrix,
+    }
+
+
 def build_static_adjacency(
-    df_geo,
+    dist_matrix: torch.Tensor | None = None,
+    df_geo=None,
     device: str = "cpu",
     k: int = 5,
     self_loops: bool = False,
     topk_sym: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """
-    Build distance/theta matrices and common static adjacency variants.
+    Build common static adjacency variants from a distance matrix.
 
     Returns a dict with:
-      - dist_matrix
-      - theta_matrix
       - A_raw
       - A_topk
       - A_row_norm
       - A_sym_norm
+
+    Backward compatibility:
+      - If `dist_matrix` is None and `df_geo` is provided, matrices are computed
+        internally and included in the output.
     """
-    geo = GeoGeometry(df_geo, device=device)
-    dist_matrix = geo.dist_matrix
-    theta_matrix = geo.theta_matrix
+    geo_mats = None
+    if dist_matrix is None:
+        if df_geo is None:
+            raise ValueError("Provide `dist_matrix` or `df_geo`.")
+        geo_mats = build_geo_matrices(df_geo=df_geo, device=device)
+        dist_matrix = geo_mats["dist_matrix"]
 
     kernel = DistanceKernel(dist_matrix)
     A_raw = kernel.compute(self_loops=self_loops)
 
-    return {
-        "dist_matrix": dist_matrix,
-        "theta_matrix": theta_matrix,
+    out = {
         "A_raw": A_raw,
         "A_topk": topk_row(A_raw, k=k, sym=topk_sym),
         "A_row_norm": row_normalize(A_raw),
         "A_sym_norm": symmetry_normalize(A_raw),
     }
+    if geo_mats is not None:
+        out["dist_matrix"] = geo_mats["dist_matrix"]
+        out["theta_matrix"] = geo_mats["theta_matrix"]
+    return out
 
 
 class WindAdjacency(nn.Module):
