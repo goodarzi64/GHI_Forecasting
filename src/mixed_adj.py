@@ -1,5 +1,37 @@
 import torch
-from src.GST_Utils import pairwise_energy, minmax_normalize, topk_row
+from src.GST_Utils import minmax_normalize, topk_row
+
+_STATIC_EXPAND_CACHE = {}
+
+
+def _get_cached_static_batch(A_static: torch.Tensor, B: int, N: int, dev: torch.device):
+    """
+    Cache expanded static adjacency [B,N,N] when batch/node size is stable.
+    Cache key includes tensor identity/version and shape/device to avoid stale reuse.
+    """
+    key = (
+        int(A_static.data_ptr()),
+        int(getattr(A_static, "_version", 0)),
+        tuple(A_static.shape),
+        B,
+        N,
+        dev.type,
+        dev.index,
+        A_static.dtype,
+    )
+    cached = _STATIC_EXPAND_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    A_dev = A_static.to(dev)
+    A_s = A_dev.unsqueeze(0).expand(B, -1, -1)
+
+    # Keep cache bounded: static graph setup usually uses one/few keys.
+    if len(_STATIC_EXPAND_CACHE) > 8:
+        _STATIC_EXPAND_CACHE.clear()
+    _STATIC_EXPAND_CACHE[key] = A_s
+    return A_s
+
 
 def build_mixed_adjacency(
     e_window,  # [B, W, N, Fe]
@@ -70,36 +102,39 @@ def build_mixed_adjacency(
     # 4) STATIC ADJACENCY
     # ============================================================
     if ablation_config["use_static"]:
-        A_s = A_static.unsqueeze(0).expand(B, -1, -1).to(dev)
+        A_s = _get_cached_static_batch(A_static, B, N, dev)
     else:
         A_s = torch.zeros(B, N, N, device=dev)
 
     # ============================================================
-    # 5) WIND ADJACENCY (LAST LAG)
+    # 5) ENERGY CORE (ALL LAGS, VECTORIZED)
+    # Reuse pairwise squared distances once for all graph types.
+    # ============================================================
+    X2 = (e_proc * e_proc).sum(dim=-1, keepdim=True)  # [B,W,N,1]
+    XY = e_proc @ e_proc.transpose(-1, -2)  # [B,W,N,N]
+    D2 = X2 + X2.transpose(-1, -2) - 2 * XY  # [B,W,N,N]
+
+    E_static_window = (A_s.unsqueeze(1) * D2).sum(dim=-1)  # [B,W,N]
+    E_dyn_window = (A_dyn.unsqueeze(1) * D2).sum(dim=-1)  # [B,W,N]
+
+    # ============================================================
+    # 6) WIND ADJACENCY + ENERGY (STREAMED)
+    # Avoid materializing full [B,W,N,N] wind tensor.
     # ============================================================
     if ablation_config["use_wind"]:
-        A_wind_list = []
+        E_wind_list = []
+        A_wind = None
         for t in range(W):
             Aw_t = WindKernel(w_window[:, t], sparse=True, k=topk_each).to(
                 device=dev, dtype=dtype
-            )
-            A_wind_list.append(Aw_t)
+            )  # [B,N,N]
+            E_wind_list.append((Aw_t * D2[:, t]).sum(dim=-1))  # [B,N]
+            A_wind = Aw_t  # keep last lag adjacency
 
-        A_wind_window = torch.stack(A_wind_list, dim=1)  # [B,W,N,N]
-        A_wind = A_wind_window[:, -1]
+        E_wind_window = torch.stack(E_wind_list, dim=1)  # [B,W,N]
     else:
-        A_wind_window = torch.zeros(B, W, N, N, device=dev)
-        A_wind = torch.zeros(B, N, N, device=dev)
-
-    # ============================================================
-    # 6) ENERGY (ALL LAGS, VECTORIZED)
-    # ============================================================
-    A_s_full = A_s.unsqueeze(1).expand(-1, W, -1, -1)
-    A_dyn_full = A_dyn.unsqueeze(1).expand(-1, W, -1, -1)
-
-    E_static_window = pairwise_energy(e_proc, A_s_full)  # [B,W,N]
-    E_dyn_window = pairwise_energy(e_proc, A_dyn_full)  # [B,W,N]
-    E_wind_window = pairwise_energy(e_proc, A_wind_window)  # [B,W,N]
+        E_wind_window = torch.zeros(B, W, N, device=dev, dtype=dtype)
+        A_wind = torch.zeros(B, N, N, device=dev, dtype=dtype)
 
     # ============================================================
     # 7) CONTEXT FEATURES (NAMED)
@@ -155,7 +190,7 @@ def build_mixed_adjacency(
     # ============================================================
     # 9) GATER
     # ============================================================
-    pi = Gater(ctx_tensor)  # [B,N,4]
+    pi = Gater(ctx_tensor)  # [B,N,3]
 
     mask = torch.tensor(
         [

@@ -14,10 +14,14 @@ from src.GST_Utils import (
     gearys_C,
     morans_I,
     pairwise_edge_energy,
+    dense_batch_to_block_sparse
 )
 from src.checkpoint_utils import load_checkpoint, save_checkpoint
 from src.mixed_adj import build_mixed_adjacency
 
+# -------------------------------------------------------------------------------
+# Evaluation function for context-gated mixed adjacency models.
+# -------------------------------------------------------------------------------
 
 @torch.no_grad()
 def evaluate_context_gated(
@@ -34,16 +38,20 @@ def evaluate_context_gated(
     compute_layer_metrics=False,
     node_const=None,
 ):
+    # Evaluation mode: disable training-time behavior (dropout, BN updates, grads).
     model.eval()
     Embedor.eval()
     Gater.eval()
     WindKernel.eval()
     device = device or next(model.parameters()).device
+    use_amp = (torch.device(device).type == "cuda")
 
+    # Containers are initialized lazily because horizon H is inferred at runtime.
     horizon_true, horizon_pred, horizon_losses, layer_metrics = None, None, None, None
     A_static = A_static.to(device)
 
     for sample in tqdm(loader, desc="Evaluating", leave=True):
+        # Unpack one mini-batch and move tensors to target device.
         x_batch, e_batch, w_batch, g_batch, y_batch = sample
 
         x_batch = x_batch.to(device)
@@ -59,6 +67,7 @@ def evaluate_context_gated(
 
         B = x_batch.shape[0]
 
+        # Build mixed adjacency per sample using static/dynamic/wind components.
         A_t, _ = build_mixed_adjacency(
             e_batch,
             w_batch,
@@ -73,56 +82,85 @@ def evaluate_context_gated(
             ablation_config=ablation_config,
         )
 
-        for b in range(B):
-            x_seq = x_batch[b].to(device)
-            y_seq = y_batch[b].to(device)
-            ei, ew = dense_to_sparse(A_t[b])
+        if not compute_layer_metrics:
+            # Fast path:
+            #   run one forward on a disconnected block graph of size B*N.
+            W, N, F_in = x_batch.shape[1], x_batch.shape[2], x_batch.shape[3]
+            x_seq_batch = x_batch.permute(1, 0, 2, 3).reshape(W, B * N, F_in)
+            ei, ew = dense_batch_to_block_sparse(A_t)
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                y_hat_bn = model(x_seq_batch, ei, ew, return_hidden=False)  # [B*N,H]
+            y_hat_batch = y_hat_bn.view(B, N, -1).permute(0, 2, 1).contiguous()  # [B,H,N]
+            H = y_hat_batch.shape[1]
 
-            y_hat, hidden_states = model(x_seq, ei, ew, return_hidden=True)
-            y_t = y_seq.transpose(0, 1).contiguous()
-            H = y_t.shape[1]
-
+            # Allocate per-horizon collectors once.
             if horizon_true is None:
                 horizon_true = [[] for _ in range(H)]
                 horizon_pred = [[] for _ in range(H)]
                 horizon_losses = [[] for _ in range(H)]
-                if compute_layer_metrics:
+
+            # Store predictions/targets horizon-wise for aggregated RMSE/MAE.
+            for h in range(H):
+                y_true_h = y_batch[:, h, :]  # [B,N]
+                y_pred_h = y_hat_batch[:, h, :]  # [B,N]
+                horizon_true[h].append(y_true_h.detach().cpu().numpy())
+                horizon_pred[h].append(y_pred_h.detach().cpu().numpy())
+                horizon_losses[h].append(torch.mean((y_pred_h - y_true_h) ** 2).item())
+        else:
+            # Detailed path:
+            #   per-sample forward with hidden states for layer diagnostics.
+            for b in range(B):
+                x_seq = x_batch[b].to(device)
+                y_seq = y_batch[b].to(device)
+                ei, ew = dense_to_sparse(A_t[b])
+
+                y_hat, hidden_states = model(x_seq, ei, ew, return_hidden=True)
+                y_t = y_seq.transpose(0, 1).contiguous()
+                H = y_t.shape[1]
+
+                # Allocate prediction and layer-metric collectors once.
+                if horizon_true is None:
+                    horizon_true = [[] for _ in range(H)]
+                    horizon_pred = [[] for _ in range(H)]
+                    horizon_losses = [[] for _ in range(H)]
                     L = model.n_layers + 1
                     layer_metrics = {
                         name: [[] for _ in range(L)]
                         for name in ["Var", "Dir", "Moran", "Geary", "MI"]
                     }
 
-            for h in range(H):
-                y_true_h, y_pred_h = y_t[:, h], y_hat[:, h]
-                horizon_true[h].append(y_true_h.detach().cpu().numpy())
-                horizon_pred[h].append(y_pred_h.detach().cpu().numpy())
-                horizon_losses[h].append(torch.mean((y_pred_h - y_true_h) ** 2).item())
+                # Per-horizon prediction tracking.
+                for h in range(H):
+                    y_true_h, y_pred_h = y_t[:, h], y_hat[:, h]
+                    horizon_true[h].append(y_true_h.detach().cpu().numpy())
+                    horizon_pred[h].append(y_pred_h.detach().cpu().numpy())
+                    horizon_losses[h].append(torch.mean((y_pred_h - y_true_h) ** 2).item())
 
-            if compute_layer_metrics:
-                features_list = [x_seq[-1]] + hidden_states
-                for l, h_l in enumerate(features_list):
-                    vals_var = torch.var(h_l, dim=0, unbiased=False)
+                # Layer diagnostics: smoothness/dispersion/spatial autocorrelation and MI.
+                features_list = [x_seq[-1]] + hidden_states # layer0 + every hidden layer
+                for l, h_l in enumerate(features_list): # h_l shape = [N, D_l]
+                    vals_var = torch.var(h_l, dim=0, unbiased=False) # variance of each feature across nodes.
 
                     dir_vals = torch.tensor(
                         [
                             pairwise_edge_energy(h_l[:, f], ei, ew).item()
                             for f in range(h_l.shape[1])
                         ]
-                    )
+                    )# Measures edge-wise roughness/smoothness of each feature across the graph.
                     mor_vals = torch.tensor(
                         [morans_I(h_l[:, f], ei, ew).item() for f in range(h_l.shape[1])]
-                    )
+                    )# Measures global spatial autocorrelation of each feature across the graph.
                     gea_vals = torch.tensor(
                         [gearys_C(h_l[:, f], ei, ew).item() for f in range(h_l.shape[1])]
-                    )
+                    )# Measures local spatial autocorrelation of each feature across the graph.
 
-                    layer_metrics["Var"][l].append(float(vals_var.mean()))
-                    layer_metrics["Dir"][l].append(float(dir_vals.mean()))
-                    layer_metrics["Moran"][l].append(float(mor_vals.mean()))
-                    layer_metrics["Geary"][l].append(float(gea_vals.mean()))
-                    layer_metrics["MI"][l].append(float(compute_mi(h_l, y_t)))
+                    layer_metrics["Var"][l].append(float(vals_var.mean()))# average variance across features for layer l
+                    layer_metrics["Dir"][l].append(float(dir_vals.mean()))# average pairwise edge energy across features for layer l
+                    layer_metrics["Moran"][l].append(float(mor_vals.mean()))# average Moran's I across features for layer l
+                    layer_metrics["Geary"][l].append(float(gea_vals.mean()))# average Geary's C across features for layer l 
+                    layer_metrics["MI"][l].append(float(compute_mi(h_l, y_t)))# average mutual information between features and target across features for layer l
 
+    # Aggregate metrics over all batches per forecast horizon.
     avg_horizon_metrics = []
     for h in range(len(horizon_true)):
         y_t_all = np.concatenate(horizon_true[h], axis=0)
@@ -132,6 +170,7 @@ def evaluate_context_gated(
             {"RMSE": np.sqrt(mse), "MAE": np.mean(np.abs(y_t_all - y_p_all))}
         )
 
+    # Global score over all horizons and all samples.
     y_true_global = np.concatenate([np.concatenate(ht, axis=0) for ht in horizon_true], axis=0)
     y_pred_global = np.concatenate([np.concatenate(hp, axis=0) for hp in horizon_pred], axis=0)
     mse = np.mean((y_true_global - y_pred_global) ** 2)
@@ -140,6 +179,7 @@ def evaluate_context_gated(
 
     avg_layer_metrics = None
     if compute_layer_metrics:
+        # Average each diagnostic across all evaluation samples.
         avg_layer_metrics = [
             {key: float(np.mean(layer_metrics[key][l])) for key in layer_metrics.keys()}
             for l in range(model.n_layers + 1)
@@ -150,8 +190,9 @@ def evaluate_context_gated(
         "PerHorizon": avg_horizon_metrics,
         "PerLayer": avg_layer_metrics,
     }
-
-
+# -------------------------------------------------------------------------------
+# Main training loop with context-gated mixed adjacency and counterfactual regularization.
+# -------------------------------------------------------------------------------
 def train_joint_context_gated(
     model,
     Embedor,
@@ -173,6 +214,8 @@ def train_joint_context_gated(
     lambda_cf=0.05,
     lambda_align=0.01,
     huber_delta=20.0,
+    cf_every_n_batches=4,
+    layer_metrics_every_n_epochs=1,
 ):
     if ablation_config is None:
         ablation_config = {
@@ -188,6 +231,13 @@ def train_joint_context_gated(
 
     optimizer = torch.optim.Adam(params, lr=lr)
     loss_fn = nn.HuberLoss(delta=huber_delta)
+    use_amp = (torch.device(device).type == "cuda")
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    if use_amp:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
 
     start_epoch = 1
     train_losses, test_metrics_history = [], []
@@ -217,7 +267,9 @@ def train_joint_context_gated(
 
         total_loss, n_batches = 0.0, 0
 
-        for sample in tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}"):
+        for batch_idx, sample in enumerate(
+            tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}"), start=1
+        ):
             x_batch, e_batch, w_batch, g_batch, y_batch = sample
             B = x_batch.size(0)
 
@@ -249,45 +301,47 @@ def train_joint_context_gated(
             ctx = aux["ctx_dict"]
 
             graph_names = ["static", "dynamic", "wind"]
+            W, N, F_in = x_batch.shape[1], x_batch.shape[2], x_batch.shape[3]
+            x_seq_batch = x_batch.permute(1, 0, 2, 3).reshape(W, B * N, F_in)
+            y_target = y_batch.transpose(1, 2).contiguous()  # [B,N,H]
 
             # ---------------- Prediction loss ----------------
-            loss_pred = 0.0
-            y_hat_full = []
-
-            for b in range(B):
-                ei, ew = dense_to_sparse(A_mix_batch[b])
-                # y_hat: [N, H]
-                # x_batch[b]: [W, N, F_in]
-                y_hat, _ = model(x_batch[b], ei, ew, return_hidden=True)
-
-                loss_b = loss_fn(y_hat, y_batch[b].transpose(0, 1).contiguous())
-                loss_pred += loss_b
-                y_hat_full.append(y_hat.detach())
-
-            loss_pred /= B
+            ei, ew = dense_batch_to_block_sparse(A_mix_batch)
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                y_hat_bn = model(x_seq_batch, ei, ew, return_hidden=False)  # [B*N,H]
+                y_hat_full = y_hat_bn.view(B, N, -1)  # [B,N,H]
+                loss_pred = loss_fn(y_hat_full, y_target)
+            y_hat_ref = y_hat_full.detach()
 
             # ---------------- Counterfactual loss ----------------
             L_cf = 0.0
             n_cf = 0
 
-            for gi, gname in enumerate(graph_names):
+            do_cf = cf_every_n_batches > 0 and (batch_idx % cf_every_n_batches == 0)
+            if do_cf:
+                base_loss_b = nn.functional.huber_loss(
+                    y_hat_ref, y_target, delta=huber_delta, reduction="none"
+                ).mean(dim=(1, 2))
+                for gi, gname in enumerate(graph_names):
 
-                if not ablation_config.get(f"use_{gname}", True):
-                    continue
+                    if not ablation_config.get(f"use_{gname}", True):
+                        continue
 
-                A_g = aux[f"A_{gname}"]
+                    A_g = aux[f"A_{gname}"]
+                    A_minus_batch = A_mix_batch - pi[:, :, gi : gi + 1] * A_g  # [B,N,N]
+                    ei_m, ew_m = dense_batch_to_block_sparse(A_minus_batch)
 
-                for b in range(B):
-                    A_minus = A_mix_batch[b] - pi[b, :, gi : gi + 1] * A_g[b]
-                    ei_m, ew_m = dense_to_sparse(A_minus)
+                    with torch.cuda.amp.autocast(enabled=use_amp):
+                        y_minus_bn = model(x_seq_batch, ei_m, ew_m, return_hidden=False)
+                        y_minus = y_minus_bn.view(B, N, -1)  # [B,N,H]
+                        delta_b = (
+                            nn.functional.huber_loss(
+                                y_minus, y_target, delta=huber_delta, reduction="none"
+                            ).mean(dim=(1, 2))
+                            - base_loss_b
+                        )
 
-                    y_minus, _ = model(x_batch[b], ei_m, ew_m, return_hidden=True)
-
-                    delta = loss_fn(y_minus, y_batch[b].transpose(0, 1)) - loss_fn(
-                        y_hat_full[b], y_batch[b].transpose(0, 1)
-                    )
-
-                    L_cf += (pi[b, :, gi] * torch.relu(delta.detach())).mean()
+                    L_cf += (pi[:, :, gi].mean(dim=1) * torch.relu(delta_b.detach())).mean()
                     n_cf += 1
 
             if n_cf > 0:
@@ -318,10 +372,12 @@ def train_joint_context_gated(
             # ---------------- Total loss ----------------
             loss = loss_pred + lambda_cf * L_cf + lambda_align * L_align
 
-            optimizer.zero_grad()
-            loss.backward()
+            optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(params, 5.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             total_loss += loss.item()
             n_batches += 1
@@ -331,6 +387,10 @@ def train_joint_context_gated(
 
         # ---------------- Evaluation ----------------
         if test_loader is not None:
+            do_layer_metrics = layer_metrics and (
+                layer_metrics_every_n_epochs > 0
+                and epoch % layer_metrics_every_n_epochs == 0
+            )
             eval_results = evaluate_context_gated(
                 model,
                 Embedor,
@@ -342,7 +402,7 @@ def train_joint_context_gated(
                 topk_each=topk_each,
                 ablation_config=ablation_config,
                 device=device,
-                compute_layer_metrics=layer_metrics,
+                compute_layer_metrics=do_layer_metrics,
                 node_const=node_const,
             )
             test_metrics_history.append(eval_results)

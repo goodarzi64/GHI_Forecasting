@@ -258,3 +258,18 @@ def compute_mi(h: torch.Tensor, y: torch.Tensor, max_samples: int = 5000) -> flo
 
     mi_per_feat = mutual_info_regression(h_np, y_np, random_state=42)
     return float(np.mean(mi_per_feat))
+
+def dense_batch_to_block_sparse(A_batch: torch.Tensor):
+    """
+    Convert dense batched adjacencies [B, N, N] into one block-diagonal sparse graph
+    over B*N nodes.
+    """
+    B, N, N2 = A_batch.shape
+    if N != N2:
+        raise ValueError("Adjacency batch must be square per sample.")
+
+    b, i, j = (A_batch != 0).nonzero(as_tuple=True)
+    edge_weight = A_batch[b, i, j]
+    node_offset = b * N
+    edge_index = torch.stack((i + node_offset, j + node_offset), dim=0)
+    return edge_index, edge_weight
