@@ -18,6 +18,7 @@ from torch.utils.data import Dataset
 @dataclass
 class GeoArtifacts:
     vars_geo: pd.DataFrame              # (N, G) scaled
+    coords: pd.DataFrame                # (N, 2) raw latitude/longitude
     station_files: List[str]            # station_code list
     geo_scaler: MinMaxScaler            # fitted scaler
 
@@ -40,6 +41,7 @@ def load_geo_and_build_static_features(
     stations_csv = os.path.join(geo_dir, stations_filename)
     df_geo = pd.read_csv(stations_csv)
     station_files = df_geo["station_code"].tolist()
+    coords = df_geo[["latitude", "longitude"]].copy()
 
     vars_geo = df_geo[["height", "Slope_DEM2_U1", "Aspect_DEM2_1", "rastercalc"]].rename(
         columns={"Slope_DEM2_U1": "slope", "Aspect_DEM2_1": "aspect", "rastercalc": "twi"}
@@ -54,7 +56,12 @@ def load_geo_and_build_static_features(
     vars_geo_scaled = geo_scaler.fit_transform(vars_geo.to_numpy())
     vars_geo = pd.DataFrame(vars_geo_scaled, columns=vars_geo.columns)
 
-    return GeoArtifacts(vars_geo=vars_geo, station_files=station_files, geo_scaler=geo_scaler)
+    return GeoArtifacts(
+        vars_geo=vars_geo,
+        coords=coords,
+        station_files=station_files,
+        geo_scaler=geo_scaler,
+    )
 
 
 # -----------------------------
