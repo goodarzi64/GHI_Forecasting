@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as Func
+from torch_geometric_temporal.nn.recurrent import GConvGRU
 
 
 class GraphGateNodewise(nn.Module):
