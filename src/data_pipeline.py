@@ -310,9 +310,9 @@ class GraphSequenceDataset(Dataset):
         return self.length
 
     def __getitem__(self, idx: int):
-        # Forecast features (drop meteo_cat)
+        # Forecast features are fully defined by mask_forecast.
         x_seq_full = self.node_tensor[idx : idx + self.lags, :, self.masks["mask_forecast"]]
-        x_seq = torch.tensor(x_seq_full[..., :-1], dtype=torch.float32)
+        x_seq = torch.tensor(x_seq_full, dtype=torch.float32)
 
         # Embedor features
         e_seq = torch.tensor(
