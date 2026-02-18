@@ -158,7 +158,7 @@ def evaluate_context_gated(
                     layer_metrics["Dir"][l].append(float(dir_vals.mean()))# average pairwise edge energy across features for layer l
                     layer_metrics["Moran"][l].append(float(mor_vals.mean()))# average Moran's I across features for layer l
                     layer_metrics["Geary"][l].append(float(gea_vals.mean()))# average Geary's C across features for layer l 
-                    layer_metrics["MI"][l].append(float(compute_mi(h_l, y_t)))# average mutual information between features and target across features for layer l
+                    layer_metrics["MI"][l].append(float(compute_mi(h_l, y_t, max_samples=5000)))# average mutual information between features and target across features for layer l
 
     # Aggregate metrics over all batches per forecast horizon.
     avg_horizon_metrics = []
@@ -353,17 +353,17 @@ def train_joint_context_gated(
 
             if "Var_E_static" in ctx:
                 v = ctx["Var_E_static"].squeeze(-1)
-                L_align += corrcoef(pi[..., graph_names.index("static")], v)
+                L_align += corrcoef(pi[..., graph_names.index("static")], v, eps=1e-8)
                 n_align += 1
 
             if "Var_E_dyn" in ctx:
                 v = ctx["Var_E_dyn"].squeeze(-1)
-                L_align -= corrcoef(pi[..., graph_names.index("dynamic")], v)
+                L_align -= corrcoef(pi[..., graph_names.index("dynamic")], v, eps=1e-8)
                 n_align += 1
 
             if "Var_E_wind" in ctx:
                 v = ctx["Var_E_wind"].squeeze(-1)
-                L_align -= corrcoef(pi[..., graph_names.index("wind")], v)
+                L_align -= corrcoef(pi[..., graph_names.index("wind")], v, eps=1e-8)
                 n_align += 1
 
             if n_align > 0:

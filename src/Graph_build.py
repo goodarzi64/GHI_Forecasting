@@ -98,14 +98,14 @@ def build_static_adjacency(
         geo_mats = build_geo_matrices(df_geo=df_geo, device=device)
         dist_matrix = geo_mats["dist_matrix"]
 
-    kernel = DistanceKernel(dist_matrix)
+    kernel = DistanceKernel(dist_matrix, sigma=None)
     A_raw = kernel.compute(self_loops=self_loops)
 
     out = {
         "A_raw": A_raw,
-        "A_topk": topk_row(A_raw, k=k, sym=topk_sym),
-        "A_row_norm": row_normalize(A_raw),
-        "A_sym_norm": symmetry_normalize(A_raw),
+        "A_topk": topk_row(A_raw, k=k, sym=topk_sym, eps=1e-8),
+        "A_row_norm": row_normalize(A_raw, eps=1e-8),
+        "A_sym_norm": symmetry_normalize(A_raw, eps=1e-8),
     }
     if geo_mats is not None:
         out["dist_matrix"] = geo_mats["dist_matrix"]
@@ -218,7 +218,7 @@ class WindAdjacency(nn.Module):
         if sparse:
             A = []
             for b in range(B):
-                A_b = topk_row(base[b], k=k, sym=False)     # returns [N,N]
+                A_b = topk_row(base[b], k=k, sym=False, eps=1e-8)     # returns [N,N]
                 A.append(A_b)
             A = torch.stack(A, dim=0)                       # [B,N,N]
         else:

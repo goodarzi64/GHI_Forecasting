@@ -136,7 +136,7 @@ class TemporalWindowAutoEncoder(nn.Module):
         else:
             z = z_seq.mean(dim=1)
         z = z.view(B, N, -1)
-        return F.normalize(z, p=2, dim=-1)
+        return F.normalize(z, p=2, dim=-1, eps=1e-12)
 
     def decode_nodes(self, z: torch.Tensor) -> torch.Tensor:
         B, N, D = z.shape
@@ -213,6 +213,7 @@ def pretrain_en_de_with_regularizers(
         embed_dim=embed_dim,
         window=window,
         conv_hidden=conv_hidden,
+        dropout=0.1,
         use_attention=use_attention,
         cloud_embed_dim=3,
         mask_cloud=mask_cloud,
@@ -360,6 +361,7 @@ def load_pretrained_embedor(
         conv_hidden=cfg["conv_hidden"],
         dropout=cfg["dropout"],
         use_attention=cfg["use_attention"],
+        cloud_embed_dim=cfg.get("cloud_embed_dim", 3),
         mask_cloud=mask_cloud,
     ).to(device)
 

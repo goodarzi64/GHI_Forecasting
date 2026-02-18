@@ -70,7 +70,7 @@ def share_metric_temporal(x_t, z_t, eps=1e-9):
     r_out_list, c_out_list, v_out_list = [], [], []
 
     for b in range(B):
-        s_in, r_in, c_in, v_in = _share_core(x_flat[b])
+        s_in, r_in, c_in, v_in = _share_core(x_flat[b], Z_ref=None)
         s_out, r_out, c_out, v_out = _share_core(z_flat[b], Z_ref=x_flat[b])
 
         share_in_list.append(s_in)

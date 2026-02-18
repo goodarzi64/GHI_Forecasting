@@ -94,7 +94,7 @@ def build_mixed_adjacency(
         S = Z_last @ Z_last.transpose(-1, -2)  # [B,N,N]
         A_dyn = torch.softmax(S / temperature, dim=-1)
         A_dyn.diagonal(dim1=-2, dim2=-1).zero_()
-        A_dyn = topk_row(A_dyn, topk_each)
+        A_dyn = topk_row(A_dyn, topk_each, sym=False, eps=1e-8)
     else:
         A_dyn = torch.zeros(B, N, N, device=dev)
 
@@ -125,7 +125,7 @@ def build_mixed_adjacency(
         E_wind_list = []
         A_wind = None
         for t in range(W):
-            Aw_t = WindKernel(w_window[:, t], sparse=True, k=topk_each).to(
+            Aw_t = WindKernel(w_window[:, t], sparse=True, k=topk_each, self_loops=False).to(
                 device=dev, dtype=dtype
             )  # [B,N,N]
             E_wind_list.append((Aw_t * D2[:, t]).sum(dim=-1))  # [B,N]
@@ -141,30 +141,30 @@ def build_mixed_adjacency(
     # ============================================================
     ctx_dict = {}
 
-    ctx_dict["E_static_last"] = minmax_normalize(E_static_window[:, -1].unsqueeze(-1))
-    ctx_dict["E_dyn_last"] = minmax_normalize(E_dyn_window[:, -1].unsqueeze(-1))
-    ctx_dict["E_wind_last"] = minmax_normalize(E_wind_window[:, -1].unsqueeze(-1))
+    ctx_dict["E_static_last"] = minmax_normalize(E_static_window[:, -1].unsqueeze(-1), dim=1, eps=1e-6)
+    ctx_dict["E_dyn_last"] = minmax_normalize(E_dyn_window[:, -1].unsqueeze(-1), dim=1, eps=1e-6)
+    ctx_dict["E_wind_last"] = minmax_normalize(E_wind_window[:, -1].unsqueeze(-1), dim=1, eps=1e-6)
 
     ctx_dict["Var_E_static"] = minmax_normalize(
-        E_static_window.var(dim=1, unbiased=False).unsqueeze(-1)
+        E_static_window.var(dim=1, unbiased=False).unsqueeze(-1), dim=1, eps=1e-6
     )
     ctx_dict["Var_E_dyn"] = minmax_normalize(
-        E_dyn_window.var(dim=1, unbiased=False).unsqueeze(-1)
+        E_dyn_window.var(dim=1, unbiased=False).unsqueeze(-1), dim=1, eps=1e-6
     )
     ctx_dict["Var_E_wind"] = minmax_normalize(
-        E_wind_window.var(dim=1, unbiased=False).unsqueeze(-1)
+        E_wind_window.var(dim=1, unbiased=False).unsqueeze(-1), dim=1, eps=1e-6
     )
 
-    ctx_dict["Deg_static"] = minmax_normalize(A_s.sum(dim=-1, keepdim=True))
-    ctx_dict["Deg_dyn"] = minmax_normalize(A_dyn.sum(dim=-1, keepdim=True))
-    ctx_dict["Deg_wind"] = minmax_normalize(A_wind.sum(dim=-1, keepdim=True))
+    ctx_dict["Deg_static"] = minmax_normalize(A_s.sum(dim=-1, keepdim=True), dim=1, eps=1e-6)
+    ctx_dict["Deg_dyn"] = minmax_normalize(A_dyn.sum(dim=-1, keepdim=True), dim=1, eps=1e-6)
+    ctx_dict["Deg_wind"] = minmax_normalize(A_wind.sum(dim=-1, keepdim=True), dim=1, eps=1e-6)
 
     # ---- non-cloud g variance ----
     if g_proc is None or g_proc.shape[-1] <= 3:
         ctx_dict["Var_g"] = torch.zeros(B, N, 1, device=dev)
     else:
         g_noncloud = g_proc[..., :-3]
-        ctx_dict["Var_g"] = minmax_normalize(g_noncloud.var(dim=1, unbiased=False))
+        ctx_dict["Var_g"] = minmax_normalize(g_noncloud.var(dim=1, unbiased=False), dim=1, eps=1e-6)
 
     # ============================================================
     # 8) CONCATENATED CONTEXT TENSOR
@@ -210,7 +210,7 @@ def build_mixed_adjacency(
     # ============================================================
     A_mix = pi[..., 0:1] * A_s + pi[..., 1:2] * A_dyn + pi[..., 2:3] * A_wind
 
-    A_mix = topk_row(A_mix, topk_each)
+    A_mix = topk_row(A_mix, topk_each, sym=False, eps=1e-8)
 
     return A_mix, {
         "pi": pi,
